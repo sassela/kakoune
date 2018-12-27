@@ -17,12 +17,6 @@ struct regex_error : runtime_error
     using runtime_error::runtime_error;
 };
 
-enum class MatchDirection
-{
-    Forward,
-    Backward
-};
-
 enum class CharacterType : unsigned char
 {
     None                    = 0,
@@ -141,17 +135,35 @@ CompiledRegex compile_regex(StringView re, RegexCompileFlags flags);
 enum class RegexExecFlags
 {
     None              = 0,
-    Search            = 1 << 0,
     NotBeginOfLine    = 1 << 1,
     NotEndOfLine      = 1 << 2,
     NotBeginOfWord    = 1 << 3,
     NotEndOfWord      = 1 << 4,
     NotInitialNull    = 1 << 5,
-    AnyMatch          = 1 << 6,
-    NoSaves           = 1 << 7,
 };
 
 constexpr bool with_bit_ops(Meta::Type<RegexExecFlags>) { return true; }
+
+enum class RegexMode
+{
+    Forward  = 1 << 0,
+    Backward = 1 << 1,
+    Search   = 1 << 2,
+    AnyMatch = 1 << 3,
+    NoSaves  = 1 << 4,
+};
+constexpr bool with_bit_ops(Meta::Type<RegexMode>) { return true; }
+constexpr bool has_direction(RegexMode mode)
+{
+    return (bool)(mode & RegexMode::Forward) xor
+           (bool)(mode & RegexMode::Backward);
+}
+
+constexpr bool is_direction(RegexMode mode)
+{
+    return has_direction(mode) and
+           (mode & ~(RegexMode::Forward | RegexMode::Backward)) == RegexMode{0};
+}
 
 template<typename It, typename=void>
 struct SentinelType { using Type = It; };
@@ -159,7 +171,7 @@ struct SentinelType { using Type = It; };
 template<typename It>
 struct SentinelType<It, void_t<typename It::Sentinel>> { using Type = typename It::Sentinel; };
 
-template<typename Iterator, MatchDirection direction>
+template<typename Iterator, RegexMode mode>
 class ThreadedRegexVM
 {
 public:
@@ -167,7 +179,7 @@ public:
       : m_program{program}
     {
         kak_assert((forward and program.first_backward_inst != 0) or
-                   (direction == MatchDirection::Backward and program.first_backward_inst != -1));
+                   (not forward and program.first_backward_inst != -1));
     }
 
     ThreadedRegexVM(const ThreadedRegexVM&) = delete;
@@ -191,7 +203,7 @@ public:
         if (flags & RegexExecFlags::NotInitialNull and begin == end)
             return false;
 
-        const bool search = (flags & RegexExecFlags::Search);
+        constexpr bool search = (mode & RegexMode::Search);
 
         ConstArrayView<CompiledRegex::Instruction> instructions{m_program.instructions};
         if (forward)
@@ -363,7 +375,7 @@ private:
                 }
                 case CompiledRegex::Save:
                 {
-                    if (config.flags & RegexExecFlags::NoSaves)
+                    if (mode & RegexMode::NoSaves)
                         break;
                     if (thread.saves < 0)
                         thread.saves = new_saves<false>(nullptr);
@@ -411,25 +423,25 @@ private:
                     break;
                 case CompiledRegex::LookAhead:
                 case CompiledRegex::NegativeLookAhead:
-                    if (lookaround<MatchDirection::Forward, false>(inst.param, pos, config) !=
+                    if (lookaround<true, false>(inst.param, pos, config) !=
                         (inst.op == CompiledRegex::LookAhead))
                         return failed();
                     break;
                 case CompiledRegex::LookAhead_IgnoreCase:
                 case CompiledRegex::NegativeLookAhead_IgnoreCase:
-                    if (lookaround<MatchDirection::Forward, true>(inst.param, pos, config) !=
+                    if (lookaround<true, true>(inst.param, pos, config) !=
                         (inst.op == CompiledRegex::LookAhead_IgnoreCase))
                         return failed();
                     break;
                 case CompiledRegex::LookBehind:
                 case CompiledRegex::NegativeLookBehind:
-                    if (lookaround<MatchDirection::Backward, false>(inst.param, pos, config) !=
+                    if (lookaround<false, false>(inst.param, pos, config) !=
                         (inst.op == CompiledRegex::LookBehind))
                         return failed();
                     break;
                 case CompiledRegex::LookBehind_IgnoreCase:
                 case CompiledRegex::NegativeLookBehind_IgnoreCase:
-                    if (lookaround<MatchDirection::Backward, true>(inst.param, pos, config) !=
+                    if (lookaround<false, true>(inst.param, pos, config) !=
                         (inst.op == CompiledRegex::LookBehind_IgnoreCase))
                         return failed();
                     break;
@@ -442,7 +454,7 @@ private:
                     m_find_next_start = true;
                     return;
                 case CompiledRegex::Match:
-                    if ((pos != config.end and not (config.flags & RegexExecFlags::Search)) or
+                    if ((pos != config.end and not (mode & RegexMode::Search)) or
                         (config.flags & RegexExecFlags::NotInitialNull and pos == config.begin))
                         return failed();
 
@@ -469,7 +481,7 @@ private:
 
         const auto& start_desc = forward ? m_program.forward_start_desc : m_program.backward_start_desc;
 
-        const bool any_match = config.flags & RegexExecFlags::AnyMatch;
+        constexpr bool any_match = mode & RegexMode::AnyMatch;
         uint16_t current_step = -1;
         m_found_match = false;
         while (true) // Iterate on all codepoints and once at the end
@@ -520,12 +532,12 @@ private:
         }
     }
 
-    template<MatchDirection look_direction, bool ignore_case>
+    template<bool look_forward, bool ignore_case>
     bool lookaround(uint32_t index, Iterator pos, const ExecConfig& config) const
     {
         using Lookaround = CompiledRegex::Lookaround;
 
-        if (look_direction == MatchDirection::Backward) 
+        if (not look_forward) 
         {
             if (pos == config.subject_begin)
                 return m_program.lookarounds[index] == Lookaround::EndOfLookaround;
@@ -534,7 +546,7 @@ private:
 
         for (auto it = m_program.lookarounds.begin() + index; *it != Lookaround::EndOfLookaround; ++it)
         {
-            if (look_direction == MatchDirection::Forward and pos == config.subject_end)
+            if (look_forward and pos == config.subject_end)
                 return false;
 
             Codepoint cp = utf8::codepoint(pos, config.subject_end);
@@ -564,11 +576,11 @@ private:
             else if (static_cast<Codepoint>(op) != cp)
                 return false;
 
-            if (look_direction == MatchDirection::Backward and pos == config.subject_begin)
+            if (not look_forward and pos == config.subject_begin)
                 return *++it == Lookaround::EndOfLookaround;
 
-            (look_direction == MatchDirection::Forward) ? utf8::to_next(pos, config.subject_end)
-                                                        : utf8::to_previous(pos, config.subject_begin);
+            look_forward ? utf8::to_next(pos, config.subject_end)
+                         : utf8::to_previous(pos, config.subject_begin);
         }
         return true;
     }
@@ -664,7 +676,8 @@ private:
         int32_t m_next = 0;
     };
 
-    static constexpr bool forward = direction == MatchDirection::Forward;
+    static_assert(has_direction(mode));
+    static constexpr bool forward = mode & RegexMode::Forward;
 
     DualThreadStack m_threads;
     Vector<Saves*, MemoryDomain::Regex> m_saves;
